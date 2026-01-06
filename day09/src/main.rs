@@ -329,8 +329,7 @@ fn main() {
     cpu.io_in.push_front(2);
     cpu.run();
 
-    // let output = get_max_output(&program);
-    // let output = get_max_feedback(&program);
+    let output = cpu.io_out.pop_back().expect("No output!");
 
-    // println!("output: {output}");
+    println!("output: {output}");
 }
