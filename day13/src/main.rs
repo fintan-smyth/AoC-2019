@@ -3,20 +3,22 @@ use std::{
     collections::{HashMap, VecDeque},
     env, fs,
     hash::Hash,
-    io::{Write, stdin, stdout},
-    process::{Output, exit},
+    io::{Read, Write, stdin, stdout},
+    thread::sleep,
+    time::Duration,
 };
 
-enum Dir {
-    North,
-    East,
-    South,
-    West,
-}
+use crossterm::{
+    event::{self, Event, KeyCode, read},
+    terminal,
+};
 
-enum Colour {
-    Black,
-    White,
+enum Tile {
+    Empty,
+    Wall,
+    Block,
+    Paddle,
+    Ball,
 }
 
 #[derive(PartialEq, Debug)]
@@ -37,7 +39,7 @@ enum Op {
 enum CpuMode {
     #[default]
     Normal,
-    BreakOnOutput,
+    ReadStdin,
 }
 
 #[derive(Copy, Clone)]
@@ -151,24 +153,26 @@ impl Cpu {
                 self.memory[self.reg[2] as usize] = self.reg[0] * self.reg[1]
             }
             Op::In => {
-                if self.io_in.is_empty() {
-                    self.state = State::Ready;
-                    println!("\x1b[35;1mWaiting for IO in...\x1b[m");
-                    return;
+                let input: i64;
+                if let CpuMode::ReadStdin = self.mode {
+                    input = read_input();
+                } else {
+                    if self.io_in.is_empty() {
+                        self.state = State::Ready;
+                        println!("\x1b[35;1mWaiting for IO in...\x1b[m");
+                        return;
+                    }
+                    input = self.io_in.pop_back().expect("No io available to read!");
+                    println!("\x1b[1;32mINPUT  <\x1b[m {}", input);
                 }
-                let input = self.io_in.pop_back().expect("No io available to read!");
                 if let RegMode::Rel = self.reg_mode[0] {
                     self.reg[0] += self.bp;
                 }
                 self.memory[self.reg[0] as usize] = input;
-                println!("\x1b[1;32mINPUT  <\x1b[m {}", input);
             }
             Op::Out => {
                 println!("\x1b[1;31mOUTPUT >\x1b[m {}", self.reg[0]);
                 self.io_out.push_front(self.reg[0]);
-                if let CpuMode::BreakOnOutput = self.mode {
-                    self.state = State::Ready;
-                }
             }
             Op::Jnz => {
                 if self.reg[0] != 0 {
@@ -291,10 +295,24 @@ fn get_cmd(instruction: i64) -> Option<Cmd> {
     }
 }
 
-struct Robot {
-    cpu: Cpu,
-    dir: Dir,
-    pos: (i64, i64),
+fn read_input() -> i64 {
+    print!("\x1b[1;32mINPUT  <\x1b[m ");
+    stdout().flush().unwrap();
+
+    let mut input = [0u8; 1];
+
+    terminal::enable_raw_mode().expect("Failed to enter raw mode");
+    stdin().read_exact(&mut input).expect("Failed to read char");
+    terminal::disable_raw_mode().expect("Failed to exit raw mode");
+    println!();
+
+    let input = input[0] as char;
+    match input {
+        'a' => -1,
+        'd' => 1,
+        ' ' => 2,
+        _ => 0,
+    }
 }
 
 fn get_input(filename: &str) -> String {
@@ -328,89 +346,13 @@ fn print_prog(program: &[i64], ip: usize) {
     println!();
 }
 
-fn read_input() -> i64 {
-    print!("\x1b[1;32mINPUT  <\x1b[m ");
-    stdout().flush().unwrap();
-
-    let mut input = String::new();
-
-    stdin().read_line(&mut input).expect("Failed to read line");
-
-    input.trim().parse().expect("Failed to read input number")
-}
-
-fn paint_tile(floor: &mut HashMap<(i64, i64), Colour>, pos: (i64, i64), col: i64) {
-    match col {
-        0 => floor.insert(pos, Colour::Black),
-        1 => floor.insert(pos, Colour::White),
-        _ => panic!("Invalid colour provided!"),
-    };
-}
-
-fn turn_robot(robot: &mut Robot, dir: i64) {
-    robot.dir = match dir {
-        0 => match robot.dir {
-            Dir::North => Dir::West,
-            Dir::East => Dir::North,
-            Dir::South => Dir::East,
-            Dir::West => Dir::South,
-        },
-        1 => match robot.dir {
-            Dir::North => Dir::East,
-            Dir::East => Dir::South,
-            Dir::South => Dir::West,
-            Dir::West => Dir::North,
-        },
-        _ => panic!("Invalid dir provided"),
-    }
-}
-
-fn move_robot(robot: &mut Robot) {
-    match robot.dir {
-        Dir::North => robot.pos.1 -= 1,
-        Dir::South => robot.pos.1 += 1,
-        Dir::East => robot.pos.0 += 1,
-        Dir::West => robot.pos.0 -= 1,
-    }
-}
-
-fn get_painted(robot: &mut Robot) -> HashMap<(i64, i64), Colour> {
-    let mut floor = HashMap::new();
-
-    robot.cpu.io_in.push_front(1);
-    floor.insert((0, 0), Colour::White);
-    // println!("io_in empty: {}", robot.cpu.io_in.is_empty());
-    loop {
-        if let State::Halted = robot.cpu.state {
-            break;
-        }
-        robot.cpu.run();
-        // println!("First break");
-        let colour = robot.cpu.io_out.pop_back().expect("No output from robot!");
-        paint_tile(&mut floor, robot.pos, colour);
-        let dir = robot.cpu.io_out.pop_back().expect("No output from robot!");
-        turn_robot(robot, dir);
-        move_robot(robot);
-        if let Some(col) = floor.get(&robot.pos) {
-            match col {
-                Colour::Black => robot.cpu.io_in.push_front(0),
-                Colour::White => robot.cpu.io_in.push_front(1),
-            }
-        } else {
-            robot.cpu.io_in.push_front(0);
-        }
-    }
-
-    floor
-}
-
-fn find_boundaries(floor: &HashMap<(i64, i64), Colour>) -> (i64, i64, i64, i64) {
+fn find_boundaries(tiles: &HashMap<(i64, i64), Tile>) -> (i64, i64, i64, i64) {
     let mut min_x = i64::MAX;
     let mut min_y = i64::MAX;
     let mut max_x = i64::MIN;
     let mut max_y = i64::MIN;
 
-    for (key, _) in floor {
+    for (key, _) in tiles {
         let (x, y) = *key;
         if x < min_x {
             min_x = x;
@@ -427,43 +369,142 @@ fn find_boundaries(floor: &HashMap<(i64, i64), Colour>) -> (i64, i64, i64, i64) 
     (min_x, min_y, max_x, max_y)
 }
 
-fn draw_floor(floor: &HashMap<(i64, i64), Colour>) -> Vec<Vec<char>> {
-    let (min_x, min_y, max_x, max_y) = find_boundaries(floor);
+fn get_canvas(tiles: &HashMap<(i64, i64), Tile>) -> Vec<Vec<char>> {
+    let (min_x, min_y, max_x, max_y) = find_boundaries(tiles);
     let n_rows = max_y - min_y + 1;
     let n_cols = max_x - min_x + 1;
     let mut canvas: Vec<Vec<char>> = Vec::new();
-    println!("min: ({},{})", min_x, min_y);
-    println!("max: ({},{})", max_x, max_y);
 
     for _ in 0..n_rows {
         let mut row: Vec<char> = Vec::new();
-        for _ in 0..n_cols {
-            row.push('.');
-        }
+        row.resize(n_cols as usize, ' ');
         canvas.push(row);
-    }
-
-    for (key, val) in floor {
-        let (x, y) = ((key.0 - min_x) as usize, (key.1 - min_y) as usize);
-        if let Colour::White = val {
-            canvas[y][x] = '#';
-        }
     }
 
     canvas
 }
 
+fn draw_canvas(tiles: &HashMap<(i64, i64), Tile>, canvas: &mut Vec<Vec<char>>) {
+    let (min_x, min_y, max_x, max_y) = find_boundaries(tiles);
+    // println!("min: ({},{})", min_x, min_y);
+    // println!("max: ({},{})", max_x, max_y);
+
+    for (key, val) in tiles {
+        let (x, y) = ((key.0 - min_x) as usize, (key.1 - min_y) as usize);
+        canvas[y][x] = match val {
+            Tile::Empty => ' ',
+            Tile::Wall => '#',
+            Tile::Block => 'X',
+            Tile::Paddle => '═',
+            Tile::Ball => 'o',
+        }
+    }
+}
+
 fn print_canvas(canvas: &Vec<Vec<char>>) {
     for row in canvas {
         for c in row {
-            if *c == '#' {
-                print!("\x1b[34m{c}\x1b[m");
-            } else {
-                print!(" ")
-            };
+            match c {
+                '#' => print!("\x1b[34;44m"),
+                'X' => print!("\x1b[35;45m"),
+                '═' => print!("\x1b[1;31m"),
+                'o' => print!("\x1b[1;32m"),
+                _ => (),
+            }
+            print!("{c}\x1b[m");
         }
         println!();
     }
+}
+
+fn get_tiles(cpu: &mut Cpu, tiles: &mut HashMap<(i64, i64), Tile>, score: &mut i64) {
+    cpu.run();
+
+    while let Some(val) = cpu.io_out.pop_back() {
+        let x = val;
+        let y = cpu.io_out.pop_back().expect("No value to read from io_out");
+        let z = cpu.io_out.pop_back().expect("No value to read from io_out");
+        if x == -1 && y == 0 {
+            *score = z;
+            continue;
+        }
+        let tile = match z {
+            0 => Tile::Empty,
+            1 => Tile::Wall,
+            2 => Tile::Block,
+            3 => Tile::Paddle,
+            4 => Tile::Ball,
+            _ => panic!("Invalid tile code provided"),
+        };
+        tiles.insert((x, y), tile);
+    }
+}
+
+fn count_blocks(tiles: &HashMap<(i64, i64), Tile>) -> i64 {
+    let mut count = 0;
+    for (_, tile) in tiles {
+        if let Tile::Block = tile {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn get_optimal_input(tiles: &HashMap<(i64, i64), Tile>) -> i64 {
+    let mut ballpos: (i64, i64) = (0, 0);
+    let mut paddlepos: (i64, i64) = (0, 0);
+
+    for (key, val) in tiles {
+        if let Tile::Ball = val {
+            ballpos = *key;
+        } else if let Tile::Paddle = val {
+            paddlepos = *key;
+        }
+    }
+
+    if paddlepos.0 < ballpos.0 {
+        return 1;
+    } else if paddlepos.0 > ballpos.0 {
+        return -1;
+    }
+    0
+}
+
+fn get_control_input(tiles: &HashMap<(i64, i64), Tile>) -> i64 {
+    let mut input = read_input();
+
+    if input == 2 {
+        input = get_optimal_input(tiles);
+    }
+
+    input
+}
+
+fn run_game(cpu: &mut Cpu, tiles: &mut HashMap<(i64, i64), Tile>) -> i64 {
+    let mut score = 0;
+    cpu.run();
+
+    get_tiles(cpu, tiles, &mut score);
+    let mut canvas = get_canvas(tiles);
+    draw_canvas(tiles, &mut canvas);
+    print_canvas(&canvas);
+    println!("Score: {score}");
+
+    loop {
+        // cpu.io_in.push_front(get_control_input(tiles));
+        cpu.io_in.push_front(get_optimal_input(tiles));
+        cpu.run();
+        get_tiles(cpu, tiles, &mut score);
+        // print!("\x1b[2J\x1b[H");
+        draw_canvas(tiles, &mut canvas);
+        print_canvas(&canvas);
+        println!("Score: {score}");
+        sleep(Duration::from_millis(20));
+        if let State::Halted = cpu.state {
+            break;
+        }
+    }
+    score
 }
 
 fn main() {
@@ -476,18 +517,14 @@ fn main() {
     let input = get_input(&args[1]);
 
     let program = get_program(input);
+    let mut cpu = Cpu::new();
+    cpu.load_program(&program);
+    cpu.memory[0] = 2;
+    // cpu.mode = CpuMode::ReadStdin;
+    let mut tiles: HashMap<(i64, i64), Tile> = HashMap::new();
 
-    let mut robot = Robot {
-        cpu: Cpu::new(),
-        dir: Dir::North,
-        pos: (0, 0),
-    };
-    robot.cpu.load_program(&program);
-    // robot.cpu.mode = CpuMode::BreakOnOutput;
+    // let output = count_blocks(&tiles);
+    let score = run_game(&mut cpu, &mut tiles);
 
-    let floor = get_painted(&mut robot);
-    let canvas = draw_floor(&floor);
-    print_canvas(&canvas);
-
-    println!("output: {}", floor.len());
+    println!("output: {}", score);
 }
